@@ -1,0 +1,168 @@
+name: NHL Game Alerts
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check-nhl:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      
+    - name: Check for NHL games
+      run: |
+        # Get today's date in Eastern Time
+        TODAY=$(TZ='America/New_York' date +%Y%m%d)
+        
+        # Fetch ESPN NHL scoreboard
+        echo "Fetching NHL games..."
+        curl -s "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard?dates=$TODAY" > games.json
+        
+        touch alerted_games.txt
+        
+        python3 << 'PYEND'
+import json
+import os
+import urllib.request
+from datetime import datetime, timezone
+
+# Read games
+with open('games.json', 'r') as f:
+    data = json.load(f)
+
+# Read alerted games
+alerted_games = set()
+try:
+    with open('alerted_games.txt', 'r') as f:
+        content = f.read().strip()
+        if content:
+            alerted_games = set(content.split(','))
+except:
+    pass
+
+current_date = datetime.now().strftime('%Y%m%d')
+alerted_games = {g for g in alerted_games if g.startswith(current_date)}
+
+starting_soon_games = []
+
+print(f"\n🏒 NHL Games Summary:")
+print(f"Total games found: {len(data.get('events', []))}")
+
+if data.get('events'):
+    print(f"\nAll games today:")
+    for event in data['events']:
+        competition = event['competitions'][0]
+        status = competition['status']['type']['name']
+        home_team = next((t for t in competition['competitors'] if t['homeAway'] == 'home'), None)
+        away_team = next((t for t in competition['competitors'] if t['homeAway'] == 'away'), None)
+        
+        if home_team and away_team:
+            away_name = away_team['team']['displayName']
+            home_name = home_team['team']['displayName']
+            status_detail = competition['status']['type']['detail']
+            print(f"  {away_name} @ {home_name} [{status_detail}]")
+
+if 'events' in data and data['events']:
+    for event in data['events']:
+        try:
+            game_id = event['id']
+            competition = event['competitions'][0]
+            status = competition['status']['type']['name']
+            game_date = competition['date']
+            
+            home_team = next((t for t in competition['competitors'] if t['homeAway'] == 'home'), None)
+            away_team = next((t for t in competition['competitors'] if t['homeAway'] == 'away'), None)
+            
+            if not home_team or not away_team:
+                continue
+            
+            away_name = away_team['team']['displayName']
+            home_name = home_team['team']['displayName']
+            
+            starting_key = f"{current_date}_{game_id}_starting"
+            
+            # Alert for scheduled games starting soon
+            if status == 'STATUS_SCHEDULED' and game_date and starting_key not in alerted_games:
+                game_start = datetime.fromisoformat(game_date.replace('Z', '+00:00'))
+                current_time_utc = datetime.now(timezone.utc)
+                minutes_until = int((game_start - current_time_utc).total_seconds() / 60)
+                
+                if 0 <= minutes_until <= 20:
+                    broadcast = competition.get('broadcasts', [{}])[0].get('names', ['No TV info'])[0] if competition.get('broadcasts') else 'No TV info'
+                    
+                    starting_soon_games.append({
+                        'away_team': away_name,
+                        'home_team': home_name,
+                        'minutes_until': minutes_until,
+                        'broadcast': broadcast
+                    })
+                    alerted_games.add(starting_key)
+                    print(f"\n  → Alert queued: {away_name} @ {home_name}")
+        except Exception as e:
+            print(f"Error processing game: {e}")
+
+webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+
+if starting_soon_games and webhook_url:
+    for game in starting_soon_games:
+        slack_message = {
+            "text": f"🏒 NHL GAME STARTING: {game['away_team']} @ {game['home_team']} in ~{game['minutes_until']} minutes",
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "🏒 NHL GAME STARTING SOON",
+                        "emoji": True
+                    }
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*{game['away_team']}* @ *{game['home_team']}*"
+                    }
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"⏰ Starting in ~{game['minutes_until']} minutes • 📺 {game['broadcast']}"
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(slack_message).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        try:
+            with urllib.request.urlopen(req) as response:
+                print(f"✓ Sent: {game['away_team']} @ {game['home_team']}")
+        except Exception as e:
+            print(f"✗ Error: {e}")
+else:
+    print("\nNo new game alerts.")
+
+with open('alerted_games.txt', 'w') as f:
+    f.write(','.join(sorted(alerted_games)))
+
+print(f"\nAlerted games today: {len(alerted_games)}")
+PYEND
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Commit state file
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add alerted_games.txt || true
+        git commit -m "Update alerted games state [skip ci]" || true
+        git push || true
